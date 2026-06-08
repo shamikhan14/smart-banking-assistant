@@ -3,7 +3,7 @@ import re
 from decimal import Decimal
 from datetime import date, datetime
 from typing import Any
-
+from uuid import UUID
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
@@ -287,15 +287,14 @@ def execute_sql(sql: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def _json_safe_value(value: Any) -> Any:
-    """
-    Convert DB values like Decimal/date/datetime to JSON-safe values.
-    """
-
     if isinstance(value, Decimal):
         return float(value)
 
     if isinstance(value, (date, datetime)):
         return value.isoformat()
+
+    if isinstance(value, UUID):
+        return str(value)
 
     return value
 
