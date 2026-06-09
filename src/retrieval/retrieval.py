@@ -1,8 +1,11 @@
 import os
-from typing import Any
+import json
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_core.tools import tool
+from pydantic import BaseModel, Field
 
 from src.core.db import get_db_conn
 
@@ -354,7 +357,6 @@ User query:
     except Exception as exc:
         print(f"[rewrite_query] LLM rewrite failed: {exc}")
 
-    # Safe fallback if LLM rewrite fails
     return [
         f"{query} banking product terms charges fees policy",
         f"{query} NorthStar Bank loan deposit credit card rules",
@@ -436,6 +438,252 @@ def retry_hybrid_search(
     }
 
 
+# ─────────────────────────────────────────────────────────────
+# Retrieval tool-calling layer
+# ─────────────────────────────────────────────────────────────
+
+class RetrievalToolDecision(BaseModel):
+    """
+    LLM decision for selecting retrieval search tool.
+    """
+
+    tool_name: Literal[
+        "vector_search_tool",
+        "fts_search_tool",
+        "hybrid_search_tool",
+    ] = Field(description="The retrieval tool to use.")
+
+    reason: str = Field(description="Reason why this retrieval tool was selected.")
+
+
+@tool
+def vector_search_tool(query: str) -> str:
+    """
+    Use this tool for simple semantic document search where the user query is broad,
+    meaning-based, or does not contain many exact policy keywords.
+    """
+
+    results = vector_search(query=query, top_k=5)
+
+    for index, result in enumerate(results, start=1):
+        result["final_rank"] = index
+        result["matched_by"] = ["vector"]
+        result["rrf_score"] = None
+        result["rerank_score"] = None
+
+    response = {
+        "status": "success" if results else "not_found",
+        "original_query": query,
+        "final_query": query,
+        "retry_count": 0,
+        "retrieval_strategy": "vector",
+        "tool_called": "vector_search_tool",
+        "results": results,
+        "message": (
+            "Results found using vector search."
+            if results
+            else "No relevant documents found."
+        ),
+    }
+
+    return json.dumps(response, default=str)
+
+
+@tool
+def fts_search_tool(query: str) -> str:
+    """
+    Use this tool when the user query contains exact banking terms, charges,
+    product names, dates, policy terms, circular numbers, or keywords that should
+    match document text.
+    """
+
+    results = fts_search(query=query, top_k=5)
+
+    for index, result in enumerate(results, start=1):
+        result["final_rank"] = index
+        result["matched_by"] = ["fts"]
+        result["rrf_score"] = None
+        result["rerank_score"] = None
+
+    response = {
+        "status": "success" if results else "not_found",
+        "original_query": query,
+        "final_query": query,
+        "retry_count": 0,
+        "retrieval_strategy": "fts",
+        "tool_called": "fts_search_tool",
+        "results": results,
+        "message": (
+            "Results found using full-text search."
+            if results
+            else "No relevant documents found."
+        ),
+    }
+
+    return json.dumps(response, default=str)
+
+
+@tool
+def hybrid_search_tool(query: str) -> str:
+    """
+    Use this tool for complex policy/document questions where semantic meaning
+    and exact keyword matching are both useful.
+
+    This runs:
+    - vector search
+    - FTS search
+    - RRF fusion
+    - reranking
+    - retry query rewrite if no results are found
+    """
+
+    response = retry_hybrid_search(
+        query=query,
+        vector_top_k=5,
+        fts_top_k=5,
+        fused_top_k=10,
+        final_top_k=5,
+        use_reranker=True,
+    )
+
+    response["retrieval_strategy"] = "hybrid"
+    response["tool_called"] = "hybrid_search_tool"
+
+    return json.dumps(response, default=str)
+
+
+def select_retrieval_tool(query: str) -> RetrievalToolDecision:
+    """
+    Let the LLM decide which retrieval tool should be used.
+    """
+
+    llm = ChatOpenAI(
+        model=OPENAI_CHAT_MODEL,
+        api_key=os.getenv("OPENAI_API_KEY"),
+        temperature=0,
+    )
+
+    structured_llm = llm.with_structured_output(RetrievalToolDecision)
+
+    prompt = f"""
+You are a retrieval tool selector for a Smart Banking Assistant.
+
+You must choose exactly one retrieval tool.
+
+Available tools:
+
+1. vector_search_tool
+Use for simple semantic search.
+Use this when:
+- the query is broad or meaning-based
+- exact keywords are not very important
+- the user asks a simple product/document question
+- the query is short and does not contain dates, charges, fees, or policy conditions
+
+Examples:
+- tell me about home loans
+- explain savings account features
+- what is a fixed deposit
+
+2. fts_search_tool
+Use for exact keyword search.
+Use this when:
+- the query contains exact terms likely present in documents
+- the query contains fee names, charges, product names, dates, circular numbers, or policy terms
+- keyword matching is more important than semantic matching
+
+Examples:
+- foreclosure charges fixed rate before 2022
+- RBI/2012-13/170
+- prepayment charges floating rate
+- international transaction fees
+
+3. hybrid_search_tool
+Use for complex document retrieval.
+Use this when:
+- the query is long or detailed
+- both semantic meaning and keyword matching are useful
+- the query has conditions like before/after dates, loan type, borrower type, product category
+- accuracy is more important than speed
+
+Examples:
+- What are the foreclosure charges for fixed rate home loans before 2022?
+- Explain international transaction fees for credit cards and applicable charges.
+- What are the premature withdrawal rules for fixed deposits before maturity?
+
+User query:
+{query}
+
+Return the selected tool_name and reason.
+"""
+
+    try:
+        decision = structured_llm.invoke(prompt)
+
+        print(f"[select_retrieval_tool] Tool: {decision.tool_name}")
+        print(f"[select_retrieval_tool] Reason: {decision.reason}")
+
+        return decision
+
+    except Exception as exc:
+        print(f"[select_retrieval_tool] Tool selection failed: {exc}")
+
+        return RetrievalToolDecision(
+            tool_name="hybrid_search_tool",
+            reason="Tool selection failed, defaulting to safest hybrid search.",
+        )
+
+
+def tool_calling_retrieval_search(query: str) -> dict[str, Any]:
+    """
+    Retrieval entry point using LLM tool selection.
+
+    The LLM chooses one retrieval tool:
+    - vector_search_tool
+    - fts_search_tool
+    - hybrid_search_tool
+
+    Then only that selected retrieval tool is executed.
+
+    Note:
+    - vector_search_tool is fastest
+    - fts_search_tool is keyword-based
+    - hybrid_search_tool is most accurate and includes retry + reranker
+    """
+
+    decision = select_retrieval_tool(query)
+
+    tool_map = {
+        "vector_search_tool": vector_search_tool,
+        "fts_search_tool": fts_search_tool,
+        "hybrid_search_tool": hybrid_search_tool,
+    }
+
+    selected_tool = tool_map[decision.tool_name]
+
+    print(f"[tool_calling_retrieval_search] Calling: {decision.tool_name}")
+
+    raw_result = selected_tool.invoke({"query": query})
+
+    try:
+        response = json.loads(raw_result)
+    except Exception:
+        response = {
+            "status": "error",
+            "original_query": query,
+            "final_query": query,
+            "retry_count": 0,
+            "retrieval_strategy": decision.tool_name,
+            "tool_called": decision.tool_name,
+            "results": [],
+            "message": str(raw_result),
+        }
+
+    response["tool_decision_reason"] = decision.reason
+
+    return response
+
+
 def print_results(results: list[dict[str, Any]]) -> None:
     """
     Pretty print retrieval results for local testing.
@@ -451,28 +699,34 @@ def print_results(results: list[dict[str, Any]]) -> None:
         print(f"Page Number     : {result.get('page_number')}")
         print(f"Document        : {result.get('document_name')}")
         print(f"Product Category: {result.get('product_category')}")
+        print(f"Retrieval Tool  : {result.get('tool_called')}")
         print(f"RRF Score       : {result.get('rrf_score')}")
         print(f"Rerank Score    : {result.get('rerank_score')}")
         print(f"Content         : {result.get('content', '')[:700]}")
 
 
 if __name__ == "__main__":
-    test_query = "What are the foreclosure charges for fixed rate home loans before 2022?"
+    test_queries = [
+        "tell me about home loans",
+        "foreclosure charges fixed rate before 2022",
+        "What are the foreclosure charges for fixed rate home loans before 2022?",
+    ]
 
-    search_response = retry_hybrid_search(
-        query=test_query,
-        vector_top_k=5,
-        fts_top_k=5,
-        fused_top_k=10,
-        final_top_k=5,
-        use_reranker=True,
-    )
+    for test_query in test_queries:
+        print("\n" + "=" * 100)
+        print(f"Query: {test_query}")
+        print("=" * 100)
 
-    print("\nSearch Status:")
-    print(f"Status       : {search_response['status']}")
-    print(f"Retry Count  : {search_response['retry_count']}")
-    print(f"Original Query: {search_response['original_query']}")
-    print(f"Final Query  : {search_response['final_query']}")
-    print(f"Message      : {search_response['message']}")
+        search_response = tool_calling_retrieval_search(query=test_query)
 
-    print_results(search_response["results"])
+        print("\nSearch Status:")
+        print(f"Status       : {search_response['status']}")
+        print(f"Tool Called  : {search_response.get('tool_called')}")
+        print(f"Strategy     : {search_response.get('retrieval_strategy')}")
+        print(f"Reason       : {search_response.get('tool_decision_reason')}")
+        print(f"Retry Count  : {search_response['retry_count']}")
+        print(f"Original Query: {search_response['original_query']}")
+        print(f"Final Query  : {search_response['final_query']}")
+        print(f"Message      : {search_response['message']}")
+
+        print_results(search_response["results"])

@@ -8,7 +8,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 
 from src.api.v1.tools.tools import AgentState, RouteDecision
-from src.retrieval.retrieval import retry_hybrid_search
+from src.retrieval.retrieval import tool_calling_retrieval_search
 from src.sql_agent.nl2sql import ask_database
 
 load_dotenv()
@@ -177,18 +177,18 @@ def out_of_scope_node(state: AgentState) -> AgentState:
 
 def rag_node(state: AgentState) -> AgentState:
     """
-    Run RAG retrieval path.
+    Run RAG retrieval path using retrieval-level tool calling.
+
+    Retrieval layer decides whether to call:
+    - vector_search_tool
+    - fts_search_tool
+    - hybrid_search_tool
     """
 
-    print("[rag_node] Running RAG retrieval")
+    print("[rag_node] Running RAG retrieval with tool-calling")
 
-    rag_result = retry_hybrid_search(
+    rag_result = tool_calling_retrieval_search(
         query=state["query"],
-        vector_top_k=5,
-        fts_top_k=5,
-        fused_top_k=10,
-        final_top_k=5,
-        use_reranker=True,
     )
 
     return {
@@ -214,18 +214,13 @@ def sql_node(state: AgentState) -> AgentState:
 
 def hybrid_node(state: AgentState) -> AgentState:
     """
-    Run both RAG and SQL paths.
+    Run both RAG retrieval tool-calling and SQL / NL2SQL path.
     """
 
-    print("[hybrid_node] Running both RAG and SQL")
+    print("[hybrid_node] Running RAG retrieval with tool-calling and SQL")
 
-    rag_result = retry_hybrid_search(
+    rag_result = tool_calling_retrieval_search(
         query=state["query"],
-        vector_top_k=5,
-        fts_top_k=5,
-        fused_top_k=10,
-        final_top_k=5,
-        use_reranker=True,
     )
 
     sql_result = ask_database(state["query"])
@@ -269,9 +264,14 @@ def response_generator_node(state: AgentState) -> AgentState:
                 for chunk in top_chunks
             ],
             "retry_count": rag_result.get("retry_count", 0),
+            "retrieval_strategy": rag_result.get("retrieval_strategy"),
+            "retrieval_tool_called": rag_result.get("tool_called"),
+            "retrieval_tool_reason": rag_result.get("tool_decision_reason"),
             "sql_query": None,
             "sql_result": None,
-            "confidence_score": top_chunks[0].get("rerank_score") if top_chunks else None,
+            "confidence_score": (
+                top_chunks[0].get("rerank_score") if top_chunks else None
+            ),
         }
 
     elif query_path == "sql":
@@ -281,6 +281,9 @@ def response_generator_node(state: AgentState) -> AgentState:
             "answer": sql_result.get("answer"),
             "citations": [],
             "retry_count": 0,
+            "retrieval_strategy": None,
+            "retrieval_tool_called": None,
+            "retrieval_tool_reason": None,
             "sql_query": sql_result.get("sql_query"),
             "sql_result": sql_result.get("sql_result"),
             "confidence_score": None,
@@ -313,9 +316,14 @@ def response_generator_node(state: AgentState) -> AgentState:
                 for chunk in top_chunks
             ],
             "retry_count": rag_result.get("retry_count", 0),
+            "retrieval_strategy": rag_result.get("retrieval_strategy"),
+            "retrieval_tool_called": rag_result.get("tool_called"),
+            "retrieval_tool_reason": rag_result.get("tool_decision_reason"),
             "sql_query": sql_result.get("sql_query"),
             "sql_result": sql_result.get("sql_result"),
-            "confidence_score": top_chunks[0].get("rerank_score") if top_chunks else None,
+            "confidence_score": (
+                top_chunks[0].get("rerank_score") if top_chunks else None
+            ),
         }
 
     else:
@@ -329,6 +337,9 @@ def response_generator_node(state: AgentState) -> AgentState:
             ),
             "citations": [],
             "retry_count": 0,
+            "retrieval_strategy": None,
+            "retrieval_tool_called": None,
+            "retrieval_tool_reason": None,
             "sql_query": None,
             "sql_result": None,
             "confidence_score": None,
@@ -407,42 +418,37 @@ def run_smart_banking_agent(query: str) -> dict[str, Any]:
 
 async def run_smart_banking_agent_stream(query: str):
     """
-    Stream LangGraph events for FastAPI StreamingResponse.
+    Safe streaming response for FastAPI StreamingResponse.
 
-    This streams LLM token chunks when available.
-    At the end, it sends DONE.
+    This avoids LangGraph internal serialization warnings caused by
+    structured output objects like RouteDecision.
     """
 
-    initial_state: AgentState = {
-        "query": query,
-        "query_path": "",
-        "rag_result": {},
-        "sql_result": {},
-        "final_response": {},
-    }
+    import asyncio
 
-    async for event in smart_banking_agent.astream_events(
-        initial_state,
-        version="v1",
-    ):
-        kind = event.get("event")
+    yield f"data: {json.dumps({'status': 'started', 'message': 'Processing your banking query...'})}\n\n"
 
-        if kind == "on_chat_model_stream":
-            chunk = event["data"]["chunk"]
-            content = chunk.content
+    try:
+        final_response = await asyncio.to_thread(run_smart_banking_agent, query)
 
-            if content:
-                yield f"data: {json.dumps({'token': content}, default=str)}\n\n"
+        yield f"data: {json.dumps({'final_response': final_response}, default=str)}\n\n"
 
-        elif kind == "on_chain_end":
-            name = event.get("name")
+    except Exception as exc:
+        error_response = {
+            "query": query,
+            "query_path": "error",
+            "answer": f"Error while processing query: {str(exc)}",
+            "citations": [],
+            "retry_count": 0,
+            "retrieval_strategy": None,
+            "retrieval_tool_called": None,
+            "retrieval_tool_reason": None,
+            "sql_query": None,
+            "sql_result": None,
+            "confidence_score": None,
+        }
 
-            if name == "LangGraph":
-                output = event.get("data", {}).get("output", {})
-                final_response = output.get("final_response")
-
-                if final_response:
-                    yield f"data: {json.dumps({'final_response': final_response}, default=str)}\n\n"
+        yield f"data: {json.dumps({'final_response': error_response}, default=str)}\n\n"
 
     yield "data: [DONE]\n\n"
 
@@ -474,6 +480,8 @@ if __name__ == "__main__":
         "hi",
         "how are you",
         "1+1",
+        "tell me about home loans",
+        "foreclosure charges fixed rate before 2022",
         "What are the foreclosure charges for fixed rate home loans before 2022?",
         "Show me all active FDs for account 1345367",
         "Show international transactions on credit card CC-881001 and explain international transaction fees",
@@ -487,4 +495,4 @@ if __name__ == "__main__":
         response = run_smart_banking_agent(question)
 
         print("\nFinal Response:")
-        print(response)
+        print(json.dumps(response, indent=2, default=str))
