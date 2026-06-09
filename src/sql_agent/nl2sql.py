@@ -11,7 +11,7 @@ from src.core.db import get_db_conn
 
 load_dotenv()
 
-OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-5.4")
 
 
 # ---------------------------------------------------------------------------

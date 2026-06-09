@@ -1,30 +1,19 @@
 import os
-from typing import Any, Literal, TypedDict
+import json
+from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
-from pydantic import BaseModel
 
+from src.api.v1.tools.tools import AgentState, RouteDecision
 from src.retrieval.retrieval import retry_hybrid_search
 from src.sql_agent.nl2sql import ask_database
 
 load_dotenv()
 
-OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-
-
-class AgentState(TypedDict):
-    query: str
-    query_path: str
-    rag_result: dict[str, Any]
-    sql_result: dict[str, Any]
-    final_response: dict[str, Any]
-
-
-class RouteDecision(BaseModel):
-    route: Literal["chitchat", "rag", "sql", "hybrid", "out_of_scope"]
-    reason: str
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-5.4")
 
 
 def get_llm() -> ChatOpenAI:
@@ -37,7 +26,7 @@ def get_llm() -> ChatOpenAI:
 
 def query_classifier_node(state: AgentState) -> AgentState:
     """
-    Classify user query into:
+    Classify user query into one route:
     - chitchat
     - rag
     - sql
@@ -57,23 +46,13 @@ Classify the user query into exactly one route.
 Routes:
 
 1. chitchat
-Use this only for light casual conversation such as:
-- greetings
-- thanks
-- asking how the assistant is
-Examples:
-- hi
-- hello
-- how are you
-- thanks
-
-Important:
+Use this only for light casual conversation such as greetings, thanks, or asking how the assistant is.
+Examples: hi, hello, how are you, thanks.
 Do NOT use chitchat for math, coding, weather, news, general knowledge, jokes, or unrelated questions.
 
 2. rag
-Use this when the question asks about banking product documents, policies, fees,
-charges, eligibility, interest rates, terms and conditions, disclosures, or rules.
-
+Use this when the question asks about banking product documents, policies, fees, charges,
+eligibility, interest rates, terms and conditions, disclosures, or rules.
 Examples:
 - What are foreclosure charges before 2022?
 - What is the FD interest rate for 444 days?
@@ -83,7 +62,6 @@ Examples:
 3. sql
 Use this when the question asks about structured customer/account data from database tables:
 accounts, transactions, loan_accounts, fixed_deposits, credit_cards, card_transactions.
-
 Examples:
 - Give me last 3 months purchase history of account 1345367.
 - What is outstanding balance for loan L-789012?
@@ -95,7 +73,6 @@ Examples:
 Use this when the question needs both:
 - SQL data from customer/account tables
 - RAG explanation from product/policy documents
-
 Examples:
 - Show international transactions on CC-881001 and explain international transaction fees.
 - Show active FDs for account 1345367 and explain premature withdrawal policy.
@@ -136,8 +113,7 @@ Return only the structured route and reason.
 
 def chitchat_node(state: AgentState) -> AgentState:
     """
-    Let LLM respond naturally to light casual conversation.
-    This is not hardcoded.
+    Let the LLM respond naturally to light casual conversation.
     """
 
     llm = get_llm()
@@ -146,7 +122,6 @@ def chitchat_node(state: AgentState) -> AgentState:
 You are a friendly Smart Banking Assistant.
 
 The user is making light casual conversation.
-
 Reply naturally and briefly.
 Do not answer math, coding, weather, news, jokes, or unrelated factual questions.
 Gently guide the user to ask about banking products, accounts, transactions, loans, FDs, or credit cards.
@@ -264,8 +239,7 @@ def hybrid_node(state: AgentState) -> AgentState:
 
 def response_generator_node(state: AgentState) -> AgentState:
     """
-    Create final response object.
-    FastAPI and Streamlit return this response.
+    Create final response object for FastAPI and Streamlit.
     """
 
     query_path = state["query_path"]
@@ -297,9 +271,7 @@ def response_generator_node(state: AgentState) -> AgentState:
             "retry_count": rag_result.get("retry_count", 0),
             "sql_query": None,
             "sql_result": None,
-            "confidence_score": (
-                top_chunks[0].get("rerank_score") if top_chunks else None
-            ),
+            "confidence_score": top_chunks[0].get("rerank_score") if top_chunks else None,
         }
 
     elif query_path == "sql":
@@ -343,9 +315,7 @@ def response_generator_node(state: AgentState) -> AgentState:
             "retry_count": rag_result.get("retry_count", 0),
             "sql_query": sql_result.get("sql_query"),
             "sql_result": sql_result.get("sql_result"),
-            "confidence_score": (
-                top_chunks[0].get("rerank_score") if top_chunks else None
-            ),
+            "confidence_score": top_chunks[0].get("rerank_score") if top_chunks else None,
         }
 
     else:
@@ -407,7 +377,6 @@ def build_agent():
 
     graph.add_edge("chitchat_node", END)
     graph.add_edge("out_of_scope_node", END)
-
     graph.add_edge("rag_node", "response_generator")
     graph.add_edge("sql_node", "response_generator")
     graph.add_edge("hybrid_node", "response_generator")
@@ -436,21 +405,57 @@ def run_smart_banking_agent(query: str) -> dict[str, Any]:
     return final_state["final_response"]
 
 
+async def run_smart_banking_agent_stream(query: str):
+    """
+    Stream LangGraph events for FastAPI StreamingResponse.
+
+    This streams LLM token chunks when available.
+    At the end, it sends DONE.
+    """
+
+    initial_state: AgentState = {
+        "query": query,
+        "query_path": "",
+        "rag_result": {},
+        "sql_result": {},
+        "final_response": {},
+    }
+
+    async for event in smart_banking_agent.astream_events(
+        initial_state,
+        version="v1",
+    ):
+        kind = event.get("event")
+
+        if kind == "on_chat_model_stream":
+            chunk = event["data"]["chunk"]
+            content = chunk.content
+
+            if content:
+                yield f"data: {json.dumps({'token': content}, default=str)}\n\n"
+
+        elif kind == "on_chain_end":
+            name = event.get("name")
+
+            if name == "LangGraph":
+                output = event.get("data", {}).get("output", {})
+                final_response = output.get("final_response")
+
+                if final_response:
+                    yield f"data: {json.dumps({'final_response': final_response}, default=str)}\n\n"
+
+    yield "data: [DONE]\n\n"
+
+
 def save_graph_image() -> None:
     """
     Save LangGraph workflow diagram as PNG.
-
-    Output:
-        docs/langgraph_agent.png
     """
 
-    output_path = "docs/langgraph_agent.png"
+    output_path = Path("docs/langgraph_agent.png")
 
     try:
-        from pathlib import Path
-
-        Path("docs").mkdir(parents=True, exist_ok=True)
-
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         png_bytes = smart_banking_agent.get_graph().draw_mermaid_png()
 
         with open(output_path, "wb") as file:

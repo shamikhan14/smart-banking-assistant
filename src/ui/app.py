@@ -1,8 +1,13 @@
+import sys
+from pathlib import Path
 from typing import Any
 
 import streamlit as st
 
-from src.agent.agent import run_smart_banking_agent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.append(str(PROJECT_ROOT))
+
+from src.api.v1.agents.agent import run_smart_banking_agent
 
 
 st.set_page_config(
@@ -10,32 +15,6 @@ st.set_page_config(
     page_icon="🏦",
     layout="wide",
 )
-
-
-def build_memory_context(messages: list[dict[str, str]], current_query: str) -> str:
-    """
-    Build short chat memory context from previous messages.
-
-    This helps the agent understand follow-up questions.
-    """
-
-    if not messages:
-        return current_query
-
-    recent_messages = messages[-6:]
-
-    memory_text = "\n".join(
-        f"{msg['role']}: {msg['content']}"
-        for msg in recent_messages
-    )
-
-    return f"""
-Previous conversation:
-{memory_text}
-
-Current user question:
-{current_query}
-"""
 
 
 def display_citations(citations: list[dict[str, Any]]) -> None:
@@ -92,13 +71,13 @@ def main() -> None:
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    if "last_response" not in st.session_state:
-        st.session_state.last_response = None
-
     with st.sidebar:
         st.subheader("Sample Questions")
 
         sample_questions = [
+            "hi",
+            "how are you",
+            "1+1",
             "What are the foreclosure charges for fixed rate home loans before 2022?",
             "Show me all active FDs for account 1345367",
             "Show international transactions on credit card CC-881001 and explain international transaction fees",
@@ -113,12 +92,19 @@ def main() -> None:
 
         if st.button("Clear chat"):
             st.session_state.messages = []
-            st.session_state.last_response = None
             st.rerun()
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+
+            response = message.get("response")
+            if response:
+                display_citations(response.get("citations", []))
+                display_sql_details(
+                    response.get("sql_query"),
+                    response.get("sql_result"),
+                )
 
     user_query = st.chat_input("Ask your banking question...")
 
@@ -140,17 +126,10 @@ def main() -> None:
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 try:
-                    query_with_memory = build_memory_context(
-                        st.session_state.messages[:-1],
-                        user_query,
-                    )
-
-                    response = run_smart_banking_agent(query_with_memory)
-                    st.session_state.last_response = response
-
+                    response = run_smart_banking_agent(user_query)
                     answer_text = format_answer(response)
-                    st.markdown(answer_text)
 
+                    st.markdown(answer_text)
                     st.caption(f"Query Path: {response.get('query_path')}")
                     st.caption(f"Retry Count: {response.get('retry_count')}")
 
@@ -171,6 +150,7 @@ def main() -> None:
                         {
                             "role": "assistant",
                             "content": answer_text,
+                            "response": response,
                         }
                     )
 
