@@ -20,6 +20,9 @@ class RAGState(TypedDict):
     route: str
     generated_sql: str
     sql_result: str
+    # Carries the SQL execution result for the hybrid RAG+SQL fusion node.
+    # Empty string when the hybrid route was not taken.
+    hybrid_rag_sql_result: str
     # Each entry: {"role": "user"|"assistant", "content": str}
     chat_history: List[Dict[str, Any]]
 

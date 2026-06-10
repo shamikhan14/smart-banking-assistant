@@ -50,7 +50,7 @@ def _clean_answer(text: str) -> str:
 # ── Node 0: Router ────────────────────────────────────────────────────────────
 
 class _RouteDecision(BaseModel):
-    route: Literal["product", "document", "smalltalk", "memory"]
+    route: Literal["product", "document", "smalltalk", "memory", "hybrid"]
     reason: str
 
 
@@ -74,7 +74,7 @@ def router_node(state: RAGState) -> RAGState:
         (
             "system",
             """You are a query router for a smart banking assistant.
-            Classify the user's query into EXACTLY one of four routes:
+            Classify the user's query into EXACTLY one of five routes:
 
             "memory"   — the query is about the current conversation history itself,
                          asking what was said, asked, or discussed in this session.
@@ -86,17 +86,35 @@ def router_node(state: RAGState) -> RAGState:
                          unrelated to banking (math, geography, jokes, coding, etc.).
                          Examples: "hi", "how are you", "bye", "1+1", "capital of France".
 
-            "product"  — asks about SPECIFIC customer data answerable from the DB:
+            "product"  — asks about SPECIFIC customer data answerable from the DB alone:
                         account balance, transaction history, credit card details,
                         fixed deposits, loan status, EMI amounts, outstanding dues.
-                        Typically mentions an account number or "my account/balance".
+                        Typically mentions an account number or "my account/balance"
+                        AND does NOT also ask about policies, eligibility rules, or
+                        product features that require the knowledge base.
 
-            "document" — asks about general banking knowledge: product features,
-                        interest rates, eligibility, policies, fees, procedures,
-                        terms & conditions.
+            "document" — asks about general banking knowledge alone: product features,
+                        interest rates, eligibility criteria, policies, fees, procedures,
+                        terms & conditions — with NO reference to a specific customer's
+                        live account data.
 
-            Priority order: memory → smalltalk → product → document.
-            When in doubt between product and document, prefer document.
+            "hybrid"   — the query genuinely needs BOTH live customer/account data
+                        from the database AND policy/product knowledge from the PDF
+                        knowledge base to give a complete answer. Use this when the
+                        question cross-references a specific customer's data against
+                        a bank policy or product rule.
+                        Examples:
+                          "Does James (account 1345367) qualify for a top-up home loan?"
+                          "Based on my transaction history, am I eligible for a credit card upgrade?"
+                          "What is the interest rate for my current loan type and when is my next EMI?"
+                          "Compare my FD rate to the current best FD rates offered by the bank."
+                          "Can I get a personal loan given my outstanding home loan balance?"
+                          "Show my last 3 months spending and explain any applicable cashback policy."
+
+            Priority order: memory → smalltalk → hybrid → product → document.
+            Choose "hybrid" whenever the answer requires fetching live DB data AND
+            looking up a policy/product rule; do NOT split such queries into product
+            or document alone.
 
             Context: {history_hint}
 
@@ -393,18 +411,211 @@ def generate_answer_node(state: RAGState) -> RAGState:
     return {**state, "response": response}
 
 
+# ── Node 4: Hybrid RAG + SQL Fusion ──────────────────────────────────────────
+#
+# This node handles queries that need BOTH:
+#   • Live customer / account data  → executed via NL2SQL against the DB
+#   • Policy / product knowledge    → retrieved from the PDF knowledge base
+#
+# Pipeline:
+#   1. Run NL2SQL exactly like nl2sql_node (generate + execute SQL)
+#   2. Run vector_search_node to retrieve relevant PDF chunks
+#   3. Rerank the retrieved docs with Cohere
+#   4. Hand BOTH the SQL result AND the reranked PDF context to a fusion LLM
+#      that synthesises a single, coherent, cited answer
+#
+# The node writes directly to state["response"] so it can wire straight to END.
+
+def hybrid_rag_node(state: RAGState) -> RAGState:
+    """Fuse live DB data (NL2SQL) with PDF knowledge-base context into one answer."""
+    llm = _get_llm()
+    db  = get_sql_database()
+
+    print("[hybrid_rag_node] ── Starting hybrid RAG + SQL pipeline ──────────────")
+
+    # ── Step 1: Generate & execute SQL ───────────────────────────────────────
+    schema_info = db.get_table_info()
+
+    sql_prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            """You are a PostgreSQL expert. Given the database schema below,
+            write a single valid SELECT query that fetches the customer/account
+            data relevant to answering the user's question.
+
+            Rules:
+            - Return ONLY the raw SQL — no explanation, no markdown fences, no backticks.
+            - Use only the tables and columns present in the schema.
+            - Do NOT generate INSERT, UPDATE, DELETE, DROP, or any DML/DDL.
+            - Always add a LIMIT clause (max 50 rows) unless the question is an aggregate.
+            - If no DB data is needed, return the string: NO_SQL_NEEDED
+
+            Database schema:
+            {schema}"""
+        ),
+        ("human", "Question: {question}")
+    ])
+
+    raw_sql_msg = (sql_prompt | llm).invoke({
+        "schema": schema_info,
+        "question": state["query"],
+    })
+
+    raw_content = raw_sql_msg.content
+    if isinstance(raw_content, list):
+        raw_content = "".join(
+            p.get("text", "") if isinstance(p, dict) else str(p)
+            for p in raw_content
+        )
+    generated_sql = raw_content.strip().strip("```").strip()
+    if generated_sql.lower().startswith("sql"):
+        generated_sql = generated_sql[3:].strip()
+
+    print(f"[hybrid_rag_node] Generated SQL:\n{generated_sql}")
+
+    if generated_sql.upper() == "NO_SQL_NEEDED":
+        sql_result = "(No database query was needed for this question.)"
+        generated_sql = ""
+    else:
+        try:
+            sql_result = db.run(generated_sql)
+        except Exception as exc:
+            sql_result = f"SQL execution error: {exc}"
+            print(f"[hybrid_rag_node] SQL error: {exc}")
+
+    print(f"[hybrid_rag_node] SQL result (truncated): {str(sql_result)[:200]}")
+
+    # ── Step 2: Vector search → retrieve PDF chunks ───────────────────────────
+    # Re-use the existing vector_search_node which handles tool-calling logic
+    # (semantic / keyword / hybrid search selection) internally.
+    intermediate_state = vector_search_node({**state})
+    retrieved_docs = intermediate_state.get("retrieved_docs", [])
+    print(f"[hybrid_rag_node] Retrieved {len(retrieved_docs)} docs from vector search.")
+
+    # ── Step 3: Rerank the PDF chunks with Cohere ─────────────────────────────
+    reranked_docs: list = []
+    if retrieved_docs:
+        try:
+            co = cohere.ClientV2(api_key=os.getenv("COHERE_API_KEY"))
+            rerank_response = co.rerank(
+                model="rerank-english-v3.0",
+                query=state["query"],
+                documents=[doc.page_content for doc in retrieved_docs],
+                top_n=min(8, len(retrieved_docs)),
+            )
+            reranked_docs = [retrieved_docs[r.index] for r in rerank_response.results]
+            print(f"[hybrid_rag_node] Reranked to top {len(reranked_docs)} PDF chunks.")
+            for i, r in enumerate(rerank_response.results):
+                print(f"  Rank {i+1} | score: {r.relevance_score:.4f} | idx: {r.index}")
+        except Exception as exc:
+            # Reranking is best-effort; fall back to raw retrieval order
+            print(f"[hybrid_rag_node] Cohere rerank failed ({exc}); using raw order.")
+            reranked_docs = retrieved_docs[:8]
+    else:
+        print("[hybrid_rag_node] No PDF chunks retrieved — SQL-only fusion.")
+
+    # ── Step 4: Build fused context strings ──────────────────────────────────
+    pdf_context = "\n\n".join([
+        f"[PDF Source: {doc.metadata.get('source', 'unknown')} | "
+        f"Page: {doc.metadata.get('page', -1) + 1 if doc.metadata.get('page') is not None else '?'}]\n"
+        f"{doc.page_content}"
+        for doc in reranked_docs
+    ]) if reranked_docs else "(No relevant policy/product documents found.)"
+
+    db_context = (
+        f"SQL Query Executed:\n{generated_sql}\n\nQuery Results:\n{sql_result}"
+        if generated_sql
+        else sql_result
+    )
+
+    # ── Step 5: Fusion LLM call ───────────────────────────────────────────────
+    structured_llm = llm.with_structured_output(AIResponse)
+
+    fusion_prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            """You are NorthStar Bank's expert assistant. You have been given TWO
+            sources of information to answer the user's question:
+
+            SOURCE A — Live Customer / Account Data (from the bank's database):
+            This contains real-time facts about the specific customer: their account
+            balances, transaction history, loan details, FD holdings, credit card
+            status, EMI schedules, etc.
+
+            SOURCE B — Bank Policy & Product Knowledge Base (from ingested PDFs):
+            This contains general banking policies, eligibility rules, interest rate
+            tables, product features, fee schedules, terms & conditions, etc.
+
+            Your task:
+            1. Use SOURCE A facts to ground the answer in the customer's actual situation.
+            2. Use SOURCE B to apply the relevant policy, eligibility rule, or product
+               information to those facts.
+            3. Synthesise BOTH into a single coherent, accurate, helpful answer.
+            4. Be explicit about which part comes from the customer's data vs. the policy.
+               For example: "Your outstanding loan balance is ₹38,20,000 (from your account).
+               The bank's top-up loan policy requires the outstanding to be below 80% of
+               the original principal — you are currently at 84.9%, so you do not yet qualify."
+            5. If SOURCE A or SOURCE B is missing or insufficient, clearly state what
+               information is unavailable and answer with whatever IS available.
+
+            Citation rules (fill the structured fields):
+            - document_name : comma-separated list of PDF documents used (from SOURCE B).
+              Write "agentic_rag_db" when only DB data was used, or append it when both.
+            - page_no        : comma-separated page numbers from SOURCE B docs used.
+            - policy_citations: readable citation, e.g. "KB_Smart_Banking.pdf, Page 5".
+            - sql_query_executed: the SQL that was run (already provided below).
+
+            CRITICAL: The `answer` field must contain ONLY plain text — no HTML tags,
+            no <div> elements, no citation cards, no SQL blocks."""
+        ),
+        (
+            "human",
+            "User Question: {query}\n\n"
+            "── SOURCE A: Live Database Data ──────────────────────────────\n"
+            "{db_context}\n\n"
+            "── SOURCE B: PDF Knowledge Base ──────────────────────────────\n"
+            "{pdf_context}"
+        ),
+    ])
+
+    fusion_chain = fusion_prompt | structured_llm
+    result = fusion_chain.invoke({
+        "query":       state["query"],
+        "db_context":  db_context,
+        "pdf_context": pdf_context,
+    })
+
+    response = result.model_dump()
+    response["answer"]             = _clean_answer(response.get("answer", ""))
+    response["sql_query_executed"] = generated_sql or None
+
+    print(f"[hybrid_rag_node] Fusion answer generated.")
+    print(f"[hybrid_rag_node] ── Hybrid pipeline complete ─────────────────────────\n")
+
+    return {
+        **state,
+        "retrieved_docs":        retrieved_docs,
+        "reranked_docs":         reranked_docs,
+        "generated_sql":         generated_sql,
+        "sql_result":            str(sql_result),
+        "hybrid_rag_sql_result": str(sql_result),
+        "response":              response,
+    }
+
+
 # ── Build the LangGraph ────────────────────────────────────────────────────────
 
 def build_rag_graph():
     graph = StateGraph(RAGState)
 
-    graph.add_node("router", router_node)
-    graph.add_node("memory", memory_node)
-    graph.add_node("smalltalk", smalltalk_node)
-    graph.add_node("nl2sql", nl2sql_node)
-    graph.add_node("vector_search", vector_search_node)
-    graph.add_node("rerank", rerank_node)
-    graph.add_node("generate_answer", generate_answer_node)
+    graph.add_node("router",         router_node)
+    graph.add_node("memory",         memory_node)
+    graph.add_node("smalltalk",      smalltalk_node)
+    graph.add_node("nl2sql",         nl2sql_node)
+    graph.add_node("vector_search",  vector_search_node)
+    graph.add_node("rerank",         rerank_node)
+    graph.add_node("generate_answer",generate_answer_node)
+    graph.add_node("hybrid_rag",     hybrid_rag_node)   # ← new fusion node
 
     graph.set_entry_point("router")
 
@@ -416,15 +627,17 @@ def build_rag_graph():
             "smalltalk": "smalltalk",
             "product":   "nl2sql",
             "document":  "vector_search",
+            "hybrid":    "hybrid_rag",     # ← new route
         }
     )
 
-    graph.add_edge("memory", END)
-    graph.add_edge("smalltalk", END)
-    graph.add_edge("nl2sql", END)
-    graph.add_edge("vector_search", "rerank")
-    graph.add_edge("rerank", "generate_answer")
-    graph.add_edge("generate_answer", END)
+    graph.add_edge("memory",         END)
+    graph.add_edge("smalltalk",      END)
+    graph.add_edge("nl2sql",         END)
+    graph.add_edge("vector_search",  "rerank")
+    graph.add_edge("rerank",         "generate_answer")
+    graph.add_edge("generate_answer",END)
+    graph.add_edge("hybrid_rag",     END)   # ← fusion node writes response directly
 
     compiled = graph.compile()
 
@@ -442,14 +655,15 @@ rag_graph = build_rag_graph()
 # ── Public entrypoint (called by query_service.py) ─────────────────────────
 def run_search_agent(query: str, chat_history: List[Dict[str, Any]] = None) -> dict:
     initial_state: RAGState = {
-        "query": query,
-        "retrieved_docs": [],
-        "reranked_docs": [],
-        "response": {},
-        "route": "",
-        "generated_sql": "",
-        "sql_result": "",
-        "chat_history": chat_history or [],
+        "query":                  query,
+        "retrieved_docs":         [],
+        "reranked_docs":          [],
+        "response":               {},
+        "route":                  "",
+        "generated_sql":          "",
+        "sql_result":             "",
+        "hybrid_rag_sql_result":  "",   # ← new field
+        "chat_history":           chat_history or [],
     }
     final_state = rag_graph.invoke(initial_state)
     return final_state["response"]
@@ -460,14 +674,15 @@ async def run_search_agent_stream(query: str, chat_history: List[Dict[str, Any]]
     import asyncio
 
     initial_state: RAGState = {
-        "query": query,
-        "retrieved_docs": [],
-        "reranked_docs": [],
-        "response": {},
-        "route": "",
-        "generated_sql": "",
-        "sql_result": "",
-        "chat_history": chat_history or [],
+        "query":                  query,
+        "retrieved_docs":         [],
+        "reranked_docs":          [],
+        "response":               {},
+        "route":                  "",
+        "generated_sql":          "",
+        "sql_result":             "",
+        "hybrid_rag_sql_result":  "",   # ← new field
+        "chat_history":           chat_history or [],
     }
 
     final_state = rag_graph.invoke(initial_state)
@@ -486,9 +701,9 @@ async def run_search_agent_stream(query: str, chat_history: List[Dict[str, Any]]
 
     # Emit structured metadata as a single trailing event
     meta = {
-        "policy_citations": response.get("policy_citations", ""),
-        "page_no":          response.get("page_no", ""),
-        "document_name":    response.get("document_name", ""),
+        "policy_citations":   response.get("policy_citations", ""),
+        "page_no":            response.get("page_no", ""),
+        "document_name":      response.get("document_name", ""),
         "sql_query_executed": response.get("sql_query_executed"),
     }
     yield f"data:{json.dumps(meta)}\n\n"
