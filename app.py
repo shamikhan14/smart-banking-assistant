@@ -10,7 +10,6 @@ import pathlib
 import time
 import json
 import requests
-
 import re
 import html as _html_lib
 
@@ -19,12 +18,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-
 # ── Client-side HTML sanitizer ────────────────────────────────────────────────
-# Belt-and-suspenders defence: strip any HTML tags that might have leaked
-# into the answer text before we embed it inside our own HTML template.
-# This prevents double-rendered citation cards or SQL blocks appearing as
-# raw markup text in the chat bubble.
 _STRIP_HTML_RE = re.compile(r"<[^>]+>", re.DOTALL)
 
 def _sanitize_answer(text: str) -> str:
@@ -117,6 +111,7 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
 }
 .stTabs [data-baseweb="tab-panel"] { padding-top: 1.5rem; }
 
+/* ── Chat bubbles ── */
 .chat-bubble-user {
     background: linear-gradient(135deg, #1e3a6e, #1a2f5e);
     border: 1px solid #2a4a80;
@@ -137,22 +132,26 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
     font-size: 0.9rem;
     line-height: 1.6;
 }
-.chat-label { font-size: 0.7rem; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 0.35rem; }
-.label-user { color: #60a5fa; }
+.chat-label {
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    margin-bottom: 0.35rem;
+}
+.label-user      { color: #60a5fa; }
 .label-assistant { color: #34d399; }
 
-.citation-card {
-    background: rgba(59,130,246,0.06);
-    border: 1px solid rgba(59,130,246,0.18);
-    border-left: 3px solid #3b82f6;
-    border-radius: 0 8px 8px 0;
-    padding: 0.6rem 0.875rem;
-    margin-top: 0.75rem;
-    font-size: 0.78rem;
-    color: #7b9cc4;
+/* ── Source info text (replaces old citation-card HTML) ── */
+.source-line {
+    font-size: 0.75rem;
+    color: #4a6a94;
+    margin-top: 0.5rem;
+    padding-top: 0.5rem;
+    border-top: 1px solid #1a2a45;
 }
-.citation-card strong { color: #93c5fd; }
 
+/* ── SQL block ── */
 .sql-block {
     background: #050d1a;
     border: 1px solid #1a2a45;
@@ -167,6 +166,7 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
     word-break: break-all;
 }
 
+/* ── Input & buttons ── */
 .stTextInput > div > div > input {
     background: #0d1626 !important;
     border: 1px solid #1a2a45 !important;
@@ -230,7 +230,6 @@ if "messages" not in st.session_state:
 if "ingested_docs" not in st.session_state:
     st.session_state.ingested_docs = []
 
-# Key trick: store pending query separately so text input can be cleared
 if "pending_query" not in st.session_state:
     st.session_state.pending_query = ""
 
@@ -258,18 +257,13 @@ tab_chat, tab_upload = st.tabs(["💬  Chat", "📄  Upload Documents"])
 with tab_chat:
 
     # ── Process any pending query FIRST (before rendering) ───────────────────
-    # This runs at the top of the tab so that after st.rerun() the query
-    # is processed immediately and the input box is already cleared.
     if st.session_state.pending_query:
         query = st.session_state.pending_query
-        st.session_state.pending_query = ""   # clear so it doesn't re-fire
+        st.session_state.pending_query = ""
 
-        # ── Build chat_history from session messages ──────────────────────────
-        # Send everything BEFORE the current user message so the backend can
-        # answer memory-style questions ("what have I asked so far?").
-        # We exclude the last message because it IS the current query.
+        # Build chat_history from all messages except the just-appended user msg
         chat_history = []
-        for msg in st.session_state.messages[:-1]:   # exclude just-appended user msg
+        for msg in st.session_state.messages[:-1]:
             if msg["role"] == "user":
                 chat_history.append({"role": "user", "content": msg["content"]})
             elif msg["role"] == "assistant":
@@ -300,12 +294,10 @@ with tab_chat:
                         continue
                     line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
 
-                    # SSE lines look like: data:<json>
                     if not line.startswith("data:"):
                         continue
                     payload_str = line[len("data:"):]
 
-                    # Terminal sentinel
                     if payload_str.strip() == "[DONE]":
                         break
 
@@ -314,7 +306,6 @@ with tab_chat:
                     except json.JSONDecodeError:
                         continue
 
-                    # ── Token event: append to growing answer ─────────────
                     if "token" in payload:
                         full_answer += payload["token"]
                         safe_token = _sanitize_answer(full_answer)
@@ -326,9 +317,6 @@ with tab_chat:
                             unsafe_allow_html=True,
                         )
 
-                    # ── Trailing metadata event (no "token" key) ──────────
-                    # The backend emits one final JSON object with citation
-                    # fields after all answer tokens have been sent.
                     for field in ("policy_citations", "page_no", "document_name", "sql_query_executed"):
                         if field in payload and "token" not in payload:
                             final_meta[field] = payload[field]
@@ -352,72 +340,7 @@ with tab_chat:
                 "sql_query_executed": None,
             })
 
-    # ── Chat history display ──────────────────────────────────────────────────
-    if not st.session_state.messages:
-        st.markdown("""
-        <div style="text-align:center; padding: 3rem 1rem; color: #3d5070;">
-            <div style="font-size:2.5rem; margin-bottom:1rem;">💬</div>
-            <div style="font-family:'DM Serif Display',serif; font-size:1.1rem; color:#7b9cc4; margin-bottom:0.5rem;">
-                Start a conversation
-            </div>
-            <div style="font-size:0.82rem; line-height:1.8;">
-                Try: <em>"What is the minimum CIBIL score for personal loans?"</em><br>
-                Or: <em>"Show me transactions for account 1345367"</em><br>
-                Or: <em>"What are the credit card interest rates?"</em>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        for msg in st.session_state.messages:
-            if msg["role"] == "user":
-                st.markdown(f"""
-                <div>
-                    <div class="chat-label label-user">You</div>
-                    <div class="chat-bubble-user">{msg["content"]}</div>
-                </div>
-                """, unsafe_allow_html=True)
-            else:
-                answer   = msg.get("answer", "")
-                citation = msg.get("policy_citations", "")
-                page     = msg.get("page_no", "")
-                doc      = msg.get("document_name", "")
-                sql      = msg.get("sql_query_executed")
-
-                citation_html = ""
-                if citation and citation not in ("N/A", ""):
-                    citation_html = f"""
-                    <div class="citation-card">
-                        <strong>📎 Source:</strong> {doc} &nbsp;|&nbsp;
-                        <strong>Page:</strong> {page}<br>
-                        <strong>Citation:</strong> {citation}
-                    </div>"""
-                elif doc and doc not in ("N/A", "", "agentic_rag_db"):
-                    citation_html = f"""
-                    <div class="citation-card">
-                        <strong>📎 Source:</strong> {doc} &nbsp;|&nbsp;
-                        <strong>Page:</strong> {page}
-                    </div>"""
-
-                sql_html = ""
-                if sql:
-                    sql_html = f'<div class="sql-block">🔍 SQL:\n{sql}</div>'
-
-                st.markdown(f"""
-                <div>
-                    <div class="chat-label label-assistant">NorthStar Assistant</div>
-                    <div class="chat-bubble-assistant">
-                        {answer}
-                        {citation_html}
-                        {sql_html}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-    st.markdown("<hr>", unsafe_allow_html=True)
-
-    # ── Input row ─────────────────────────────────────────────────────────────
-    # input_key increments on send → forces Streamlit to recreate the widget
-    # with an empty value, effectively clearing the text box.
+    # ── Input row (pinned above chat history) ────────────────────────────────
     col_input, col_send, col_clear = st.columns([8, 1, 1])
 
     with col_input:
@@ -434,21 +357,114 @@ with tab_chat:
     with col_clear:
         clear_clicked = st.button("Clear", use_container_width=True, key="btn_clear")
 
+    st.markdown("<hr>", unsafe_allow_html=True)
+
     # ── Button handlers ───────────────────────────────────────────────────────
     if clear_clicked:
         st.session_state.messages = []
         st.session_state.pending_query = ""
-        st.session_state.input_key += 1   # clears the text box too
+        st.session_state.input_key += 1
         st.rerun()
 
     if send_clicked and user_input.strip():
-        # Store the user message immediately
         st.session_state.messages.append({"role": "user", "content": user_input.strip()})
-        # Park the query so the top-of-tab processor picks it up
         st.session_state.pending_query = user_input.strip()
-        # Increment key to clear the input widget on next render
         st.session_state.input_key += 1
         st.rerun()
+
+    # ── Chat history display — newest first ───────────────────────────────────
+    # Pair up messages (user + assistant) and reverse so newest pair is at top.
+    if not st.session_state.messages:
+        st.markdown("""
+        <div style="text-align:center; padding: 3rem 1rem; color: #3d5070;">
+            <div style="font-size:2.5rem; margin-bottom:1rem;">💬</div>
+            <div style="font-family:'DM Serif Display',serif; font-size:1.1rem; color:#7b9cc4; margin-bottom:0.5rem;">
+                Start a conversation
+            </div>
+            <div style="font-size:0.82rem; line-height:1.8;">
+                Try: <em>"What is the minimum CIBIL score for personal loans?"</em><br>
+                Or: <em>"Show me transactions for account 1345367"</em><br>
+                Or: <em>"What are the credit card interest rates?"</em>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        # ── Build (user_msg, assistant_msg) pairs ─────────────────────────────
+        # Walk the flat list and group consecutive user→assistant turns.
+        # Unpaired messages (e.g. a user msg still awaiting a response) are
+        # shown on their own.
+        pairs: list[tuple] = []
+        i = 0
+        msgs = st.session_state.messages
+        while i < len(msgs):
+            if msgs[i]["role"] == "user":
+                user_msg = msgs[i]
+                # Check if the next message is the assistant's reply
+                if i + 1 < len(msgs) and msgs[i + 1]["role"] == "assistant":
+                    pairs.append((user_msg, msgs[i + 1]))
+                    i += 2
+                else:
+                    pairs.append((user_msg, None))
+                    i += 1
+            else:
+                # Orphaned assistant message (shouldn't normally happen)
+                pairs.append((None, msgs[i]))
+                i += 1
+
+        # Reverse so newest conversation turn appears at the top
+        for user_msg, assistant_msg in reversed(pairs):
+
+            # ── Assistant bubble ──────────────────────────────────────────────
+            if assistant_msg:
+                answer   = assistant_msg.get("answer", "")
+                citation = assistant_msg.get("policy_citations", "")
+                page     = assistant_msg.get("page_no", "")
+                doc      = assistant_msg.get("document_name", "")
+                sql      = assistant_msg.get("sql_query_executed")
+
+                # Build plain-text source line (no HTML cards)
+                source_parts = []
+                if doc and doc not in ("N/A", "", "agentic_rag_db"):
+                    source_parts.append(f"📄 {doc}")
+                if page and page not in ("N/A", ""):
+                    source_parts.append(f"Page {page}")
+                if citation and citation not in ("N/A", ""):
+                    source_parts.append(citation)
+
+                source_line = "  ·  ".join(source_parts) if source_parts else ""
+
+                # SQL block (kept as preformatted text, not HTML)
+                sql_section = f"\n\n🔍 SQL:\n{sql}" if sql else ""
+
+                # Render assistant bubble — answer is plain text; source is
+                # a small muted line appended below, SQL in a code block
+                st.markdown(
+                    f'<div class="chat-label label-assistant">NorthStar Assistant</div>',
+                    unsafe_allow_html=True,
+                )
+                with st.container():
+                    st.markdown(
+                        f'<div class="chat-bubble-assistant">{answer}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    if source_line:
+                        st.markdown(
+                            f'<div class="source-line">📎 {source_line}</div>',
+                            unsafe_allow_html=True,
+                        )
+                    if sql:
+                        st.code(sql, language="sql")
+
+            # ── User bubble ───────────────────────────────────────────────────
+            if user_msg:
+                st.markdown(
+                    f"""<div class="chat-label label-user">You</div>
+                    <div class="chat-bubble-user">{user_msg["content"]}</div>""",
+                    unsafe_allow_html=True,
+                )
+
+            # Subtle divider between conversation turns
+            st.markdown("<hr>", unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -496,12 +512,8 @@ with tab_upload:
                 status = st.empty()
 
                 try:
-                    # Write upload to a named temp file on disk
                     suffix = pathlib.Path(uploaded_file.name).suffix or ".pdf"
-                    with tempfile.NamedTemporaryFile(
-                        delete=False,
-                        suffix=suffix,
-                    ) as tmp:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                         tmp.write(uploaded_file.getbuffer())
                         tmp_path = tmp.name
 
@@ -530,7 +542,6 @@ with tab_upload:
                         f"{result.get('chunks_ingested', 0)} chunks stored."
                     )
 
-                    # Clean up temp file
                     pathlib.Path(tmp_path).unlink(missing_ok=True)
 
                 except Exception as e:
