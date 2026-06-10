@@ -21,5 +21,12 @@ def query_endpoint(request: QueryRequest):
 @router.post("/query/stream")
 async def stream_query_endpoint(request: QueryRequest):
     """Endpoint returning streaming responses with Guardrails."""
-    generator = await query_documents_stream(request.query)
-    return StreamingResponse(generator, media_type="text/event-stream")
+    try:
+        generator = await query_documents_stream(request.query)
+        return StreamingResponse(generator, media_type="text/event-stream")
+    except GuardrailViolation as violation:
+        raise HTTPException(
+            status_code=400,
+            detail={"guardrail": violation.guard, "message": violation.message},
+        )
+    
