@@ -29,3 +29,4 @@ async def stream_query_endpoint(request: QueryRequest):
             status_code=400,
             detail={"guardrail": violation.guard, "message": violation.message},
         )
+    
