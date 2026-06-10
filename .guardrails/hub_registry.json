@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "validators": {
+    "guardrails/regex_match": {
+      "import_path": "guardrails_grhub_regex_match",
+      "exports": [
+        "RegexMatch"
+      ],
+      "installed_at": "2026-06-09T13:39:59.702916+00:00",
+      "package_name": "guardrails-grhub-regex-match"
+    },
+    "guardrails/toxic_language": {
+      "import_path": "guardrails_grhub_toxic_language",
+      "exports": [
+        "ToxicLanguage"
+      ],
+      "installed_at": "2026-06-09T13:41:12.554640+00:00",
+      "package_name": "guardrails-grhub-toxic-language"
+    }
+  }
+}
