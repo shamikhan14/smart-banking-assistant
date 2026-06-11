@@ -219,6 +219,48 @@ hr { border-color: #1a2a45 !important; }
     color: #7b9cc4;
 }
 .doc-name { color: #c8d8f0; font-weight: 500; }
+
+/* ── Thinking indicator ── */
+@keyframes thinking-pulse {
+    0%, 100% { opacity: 0.3; transform: scale(0.85); }
+    50%       { opacity: 1;   transform: scale(1.1); }
+}
+.thinking-bar {
+    background: #0d1626;
+    border: 1px solid #1a2a45;
+    border-radius: 16px 16px 16px 4px;
+    padding: 1rem 1.25rem;
+    margin: 0.5rem 3rem 0.5rem 0;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+.thinking-dots {
+    display: flex;
+    gap: 5px;
+    align-items: center;
+}
+.thinking-dots span {
+    width: 8px; height: 8px;
+    background: #3b82f6;
+    border-radius: 50%;
+    display: inline-block;
+    animation: thinking-pulse 1.4s ease-in-out infinite;
+}
+.thinking-dots span:nth-child(2) { animation-delay: 0.2s; background: #60a5fa; }
+.thinking-dots span:nth-child(3) { animation-delay: 0.4s; background: #93c5fd; }
+.thinking-text {
+    color: #4a6a94;
+    font-size: 0.82rem;
+    font-style: italic;
+    letter-spacing: 0.3px;
+}
+
+/* ── Disabled input while processing ── */
+.stTextInput > div > div > input:disabled {
+    opacity: 0.5 !important;
+    cursor: not-allowed !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -256,7 +298,47 @@ tab_chat, tab_upload = st.tabs(["💬  Chat", "📄  Upload Documents"])
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_chat:
 
-    # ── Process any pending query FIRST (before rendering) ───────────────────
+    # ── Input row — always rendered first so it never disappears ─────────────
+    col_input, col_send, col_clear = st.columns([8, 1, 1])
+
+    with col_input:
+        user_input = st.text_input(
+            label="query",
+            placeholder="Ask anything about NorthStar Bank...",
+            label_visibility="collapsed",
+            key=f"chat_input_{st.session_state.input_key}",
+        )
+
+    with col_send:
+        send_clicked = st.button(
+            "Send",
+            use_container_width=True,
+            key="btn_send",
+        )
+
+    with col_clear:
+        clear_clicked = st.button(
+            "Clear",
+            use_container_width=True,
+            key="btn_clear",
+        )
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+
+    # ── Button handlers ───────────────────────────────────────────────────────
+    if clear_clicked:
+        st.session_state.messages = []
+        st.session_state.pending_query = ""
+        st.session_state.input_key += 1
+        st.rerun()
+
+    if send_clicked and user_input.strip():
+        st.session_state.messages.append({"role": "user", "content": user_input.strip()})
+        st.session_state.pending_query = user_input.strip()
+        st.session_state.input_key += 1
+        st.rerun()
+
+    # ── Process any pending query ─────────────────────────────────────────────
     if st.session_state.pending_query:
         query = st.session_state.pending_query
         st.session_state.pending_query = ""
@@ -269,8 +351,21 @@ with tab_chat:
             elif msg["role"] == "assistant":
                 chat_history.append({"role": "assistant", "content": msg.get("answer", "")})
 
-        # ── Stream from /query/stream (SSE) ──────────────────────────────────
+        # ── Thinking indicator placeholder ────────────────────────────────────
         stream_placeholder = st.empty()
+        stream_placeholder.markdown(
+            """<div>
+                <div class="chat-label label-assistant">NorthStar Assistant</div>
+                <div class="thinking-bar">
+                    <div class="thinking-dots">
+                        <span></span><span></span><span></span>
+                    </div>
+                    <div class="thinking-text">Thinking…</div>
+                </div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
         full_answer = ""
         final_meta = {
             "policy_citations": "",
@@ -287,6 +382,25 @@ with tab_chat:
                 timeout=120,
                 headers={"Accept": "text/event-stream"},
             ) as resp:
+
+                # ── Input guardrail blocked (HTTP 400) ────────────────────
+                if resp.status_code == 400:
+                    try:
+                        detail   = resp.json().get("detail", {})
+                        guard_msg = detail.get("message", "Your message was blocked by a safety filter.")
+                    except Exception:
+                        guard_msg = "Your message was blocked by a safety filter."
+                    stream_placeholder.empty()
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "answer": f"🚫 **Guardrail triggered:** {guard_msg}",
+                        "policy_citations": "",
+                        "page_no": "",
+                        "document_name": "",
+                        "sql_query_executed": None,
+                    })
+                    st.rerun()
+
                 resp.raise_for_status()
 
                 for raw_line in resp.iter_lines():
@@ -305,6 +419,19 @@ with tab_chat:
                         payload = json.loads(payload_str)
                     except json.JSONDecodeError:
                         continue
+
+                    # ── Output guardrail blocked (SSE event) ──────────────
+                    if payload.get("guardrail_error"):
+                        stream_placeholder.empty()
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "answer": f"🚫 **Output blocked:** {payload.get('message', 'Response flagged by safety filter.')}",
+                            "policy_citations": "",
+                            "page_no": "",
+                            "document_name": "",
+                            "sql_query_executed": None,
+                        })
+                        st.rerun()
 
                     if "token" in payload:
                         full_answer += payload["token"]
@@ -329,6 +456,22 @@ with tab_chat:
                 **final_meta,
             })
 
+        except requests.HTTPError as e:
+            stream_placeholder.empty()
+            try:
+                detail    = e.response.json().get("detail", {})
+                guard_msg = detail.get("message") or str(e)
+            except Exception:
+                guard_msg = str(e)
+            st.session_state.messages.append({
+                "role": "assistant",
+                "answer": f"🚫 **Request blocked:** {guard_msg}",
+                "policy_citations": "",
+                "page_no": "",
+                "document_name": "",
+                "sql_query_executed": None,
+            })
+
         except Exception as e:
             stream_placeholder.empty()
             st.session_state.messages.append({
@@ -339,38 +482,6 @@ with tab_chat:
                 "document_name": "",
                 "sql_query_executed": None,
             })
-
-    # ── Input row (pinned above chat history) ────────────────────────────────
-    col_input, col_send, col_clear = st.columns([8, 1, 1])
-
-    with col_input:
-        user_input = st.text_input(
-            label="query",
-            placeholder="Ask anything about NorthStar Bank...",
-            label_visibility="collapsed",
-            key=f"chat_input_{st.session_state.input_key}",
-        )
-
-    with col_send:
-        send_clicked = st.button("Send", use_container_width=True, key="btn_send")
-
-    with col_clear:
-        clear_clicked = st.button("Clear", use_container_width=True, key="btn_clear")
-
-    st.markdown("<hr>", unsafe_allow_html=True)
-
-    # ── Button handlers ───────────────────────────────────────────────────────
-    if clear_clicked:
-        st.session_state.messages = []
-        st.session_state.pending_query = ""
-        st.session_state.input_key += 1
-        st.rerun()
-
-    if send_clicked and user_input.strip():
-        st.session_state.messages.append({"role": "user", "content": user_input.strip()})
-        st.session_state.pending_query = user_input.strip()
-        st.session_state.input_key += 1
-        st.rerun()
 
     # ── Chat history display — newest first ───────────────────────────────────
     # Pair up messages (user + assistant) and reverse so newest pair is at top.
@@ -517,33 +628,50 @@ with tab_upload:
                         tmp.write(uploaded_file.getbuffer())
                         tmp_path = tmp.name
 
-                    progress_bar.progress(15, text="Parsing PDF with Docling...")
-                    status.info("🔍 Extracting text, tables, and images from PDF...")
+                    progress_bar.progress(15, text="Uploading to backend...")
+                    status.info("🔍 Sending PDF to the ingestion service...")
 
-                    from src.ingestion.ingestion import run_ingestion
+                    # ── Send to backend API (avoids psycopg_pool / DB imports in UI) ──
+                    with open(tmp_path, "rb") as pdf_file:
+                        ingest_resp = requests.post(
+                            f"{_API_BASE}/api/v1/ingest",
+                            files={"file": (uploaded_file.name, pdf_file, "application/pdf")},
+                            timeout=300,
+                        )
 
-                    progress_bar.progress(35, text="Chunking and embedding (this may take a minute)...")
-                    status.info("🧠 Generating embeddings for all chunks...")
+                    progress_bar.progress(80, text="Processing chunks...")
 
-                    result = run_ingestion(tmp_path)
+                    if ingest_resp.status_code == 200:
+                        result = ingest_resp.json()
+                        progress_bar.progress(100, text="Done!")
 
-                    progress_bar.progress(95, text="Storing in vector database...")
-                    time.sleep(0.3)
-                    progress_bar.progress(100, text="Done!")
+                        st.session_state.ingested_docs.append({
+                            "name": uploaded_file.name,
+                            "chunks": result.get("chunks_ingested", 0),
+                            "doc_id": result.get("doc_id", ""),
+                        })
 
-                    st.session_state.ingested_docs.append({
-                        "name": uploaded_file.name,
-                        "chunks": result.get("chunks_ingested", 0),
-                        "doc_id": result.get("doc_id", ""),
-                    })
-
-                    status.success(
-                        f"✅ **{uploaded_file.name}** ingested — "
-                        f"{result.get('chunks_ingested', 0)} chunks stored."
-                    )
+                        status.success(
+                            f"✅ **{uploaded_file.name}** ingested — "
+                            f"{result.get('chunks_ingested', 0)} chunks stored."
+                        )
+                    else:
+                        try:
+                            err_detail = ingest_resp.json().get("detail", ingest_resp.text)
+                        except Exception:
+                            err_detail = ingest_resp.text
+                        progress_bar.empty()
+                        status.error(f"❌ Ingestion failed (HTTP {ingest_resp.status_code}): {err_detail}")
 
                     pathlib.Path(tmp_path).unlink(missing_ok=True)
 
+                except requests.exceptions.ConnectionError:
+                    progress_bar.empty()
+                    status.error(
+                        "❌ Could not connect to the backend. "
+                        "Make sure the FastAPI server is running (`uvicorn main:app --reload`) "
+                        "and `API_BASE_URL` in your `.env` is correct."
+                    )
                 except Exception as e:
                     progress_bar.empty()
                     status.error(f"❌ Ingestion failed: {str(e)}")
