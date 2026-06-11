@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from uuid import uuid4
 from typing import Literal, List, Dict, Any
 import cohere
 from dotenv import load_dotenv
@@ -8,6 +9,17 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from pydantic import BaseModel
+
+try:
+    from langsmith import Client as LangSmithClient, traceable
+except Exception:
+    LangSmithClient = None
+
+    def traceable(*args, **kwargs):
+        """Fallback no-op decorator when langsmith is unavailable."""
+        def decorator(func):
+            return func
+        return decorator
 
 from src.api.v1.schemas.query_schema import AIResponse
 from src.api.v1.tools.tools import RAGState, vector_search_node
@@ -38,6 +50,13 @@ _SQL_BLOCK_RE = re.compile(
     r'<div class="sql-block">.*?</div>', re.DOTALL | re.IGNORECASE
 )
 
+# Lightweight PII leak checks for evaluator metadata.
+# These checks do not change the final answer; they only help LangSmith review.
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_INDIAN_MOBILE_RE = re.compile(r"(?<!\d)(?:\+91[-\s]?)?[6-9]\d{9}(?!\d)")
+_PAN_RE = re.compile(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b")
+_AADHAAR_RE = re.compile(r"(?<!\d)\d{4}[-\s]?\d{4}[-\s]?\d{4}(?!\d)")
+
 def _clean_answer(text: str) -> str:
     """Remove stray HTML from the answer field before sending to the UI."""
     text = _CITATION_CARD_RE.sub("", text)
@@ -47,10 +66,170 @@ def _clean_answer(text: str) -> str:
     return text.strip()
 
 
+# ── Helper: LangSmith metadata tracing + evaluator-ready final output ─────────
+
+def _build_trace_config(
+    *,
+    query: str,
+    chat_history: List[Dict[str, Any]] | None,
+    session_type: str,
+    run_name: str,
+    extra_tags: List[str] | None = None,
+) -> tuple[dict, str, dict]:
+    """Build LangSmith config metadata without changing agent execution logic."""
+    run_id = str(uuid4())
+    base_metadata = {
+        "project": os.getenv("LANGSMITH_PROJECT", "smart-banking-assistant"),
+        "course_code": os.getenv("COURSE_CODE", "BFSI-ARAG-002"),
+        "application": "Smart Banking Assistant",
+        "environment": os.getenv("APP_ENV", "local"),
+        "session_type": session_type,
+        "query": query,
+        "query_length": len(query or ""),
+        "chat_history_count": len(chat_history or []),
+        "agent_framework": "LangGraph",
+        "graph_name": "smart_banking_rag_graph",
+        "entry_node": "router",
+        "expected_routes": ["document", "banking_data", "hybrid", "smalltalk", "memory"],
+        "retrieval_strategy": "vector_search_with_rerank",
+        "vector_database": "PostgreSQL_pgvector",
+        "reranker": "Cohere_rerank_english_v3_0",
+        "citation_required_for": ["document", "hybrid"],
+        "sql_safety_required": True,
+        "allowed_sql_type": "SELECT_ONLY",
+        "evaluator_focus": [
+            "conciseness_check",
+            "hallucination_check",
+            "pii_leak_check",
+            "citation_presence",
+            "route_correctness",
+            "sql_safety",
+        ],
+    }
+
+    tags = [
+        "smart-banking-assistant",
+        "langgraph",
+        "capstone",
+        "metadata-tracing",
+        "evaluator-ready",
+    ]
+    if extra_tags:
+        tags.extend(extra_tags)
+
+    config = {
+        "run_id": run_id,
+        "run_name": run_name,
+        "tags": tags,
+        "metadata": base_metadata,
+    }
+    return config, run_id, base_metadata
+
+
+def _build_evaluator_metadata(final_state: RAGState) -> dict:
+    """Create dynamic evaluator metadata from the actual final response/state."""
+    response = final_state.get("response", {}) or {}
+    answer = _clean_answer(response.get("answer", "") or "")
+    answer_words = answer.split()
+
+    route = final_state.get("route") or "unknown"
+    policy_citations = response.get("policy_citations", "") or ""
+    document_name = response.get("document_name", "") or ""
+    page_no = response.get("page_no", "") or ""
+    generated_sql = final_state.get("generated_sql") or response.get("sql_query_executed") or ""
+    sql_result = final_state.get("sql_result") or ""
+
+    citation_present = bool(
+        str(policy_citations).strip()
+        and str(policy_citations).strip().upper() not in {"N/A", "NA", "NONE"}
+    )
+    sql_present = bool(str(generated_sql).strip())
+    answer_word_count = len(answer_words)
+
+    detected_pii_patterns = []
+    if _EMAIL_RE.search(answer):
+        detected_pii_patterns.append("email")
+    if _INDIAN_MOBILE_RE.search(answer):
+        detected_pii_patterns.append("mobile")
+    if _PAN_RE.search(answer):
+        detected_pii_patterns.append("pan")
+    if _AADHAAR_RE.search(answer):
+        detected_pii_patterns.append("aadhaar")
+
+    pii_leak_detected = bool(detected_pii_patterns)
+
+    # Lightweight deterministic checks for evaluator review.
+    # Hallucination is not fully proven here; this flags risk based on grounding signals.
+    citation_required = route in {"document", "hybrid"}
+    hallucination_risk = "low" if (
+        route in {"banking_data", "smalltalk", "memory"}
+        or sql_present
+        or (citation_required and citation_present)
+    ) else "needs_review"
+
+    conciseness_check = "pass" if answer_word_count <= 120 else "review_needed"
+
+    return {
+        "actual_route": route,
+        "retrieved_docs_count": len(final_state.get("retrieved_docs") or []),
+        "reranked_docs_count": len(final_state.get("reranked_docs") or []),
+        "generated_sql_present": sql_present,
+        "sql_result_present": bool(str(sql_result).strip()),
+        "citation_present": citation_present,
+        "citation_required": citation_required,
+        "document_name": document_name,
+        "page_no": page_no,
+        "answer_char_count": len(answer),
+        "answer_word_count": answer_word_count,
+        "answer_present": bool(answer.strip()),
+        "conciseness_check": conciseness_check,
+        "conciseness_rule": "pass when answer_word_count <= 120",
+        "hallucination_check": hallucination_risk,
+        "hallucination_check_method": "heuristic grounding check using route, citation presence, and SQL presence",
+        "hallucination_note": "Use LangSmith LLM-as-judge evaluator for final hallucination scoring.",
+        "pii_leak_check": "needs_review" if pii_leak_detected else "pass",
+        "pii_leak_detected": pii_leak_detected,
+        "pii_patterns_detected": detected_pii_patterns,
+        "pii_check_method": "regex check for email, Indian mobile number, PAN, and Aadhaar-like patterns in final answer",
+    }
+
+
+def _safe_update_langsmith_metadata(run_id: str, metadata: dict) -> None:
+    """Best-effort update of completed LangSmith run metadata; never breaks API flow."""
+    if LangSmithClient is None or not os.getenv("LANGSMITH_API_KEY"):
+        return
+    try:
+        LangSmithClient().update_run(run_id, extra={"metadata": metadata})
+    except Exception as exc:
+        print(f"[langsmith_metadata] Could not update evaluator metadata: {exc}")
+
+
+@traceable(
+    name="smart_banking_final_response",
+    run_type="chain",
+    tags=["smart-banking-assistant", "final-response", "evaluator-ready"],
+)
+def _capture_final_response_for_evaluators(
+    query: str,
+    response: dict,
+    evaluator_metadata: dict,
+) -> dict:
+    """Expose final assistant response as clean LangSmith output for evaluators.
+
+    This does not change business logic. It only creates a LangSmith run whose
+    outputs contain `answer`, so conciseness, hallucination, and PII leak
+    evaluators can read `outputs.answer` instead of an empty graph state.
+    """
+    return {
+        **(response or {}),
+        "evaluator_metadata": evaluator_metadata,
+    }
+
+
 # ── Node 0: Router ────────────────────────────────────────────────────────────
 
 class _RouteDecision(BaseModel):
-    route: Literal["product", "document", "smalltalk", "memory", "hybrid"]
+    route: Literal["banking_data", "document", "smalltalk", "memory", "hybrid"]
     reason: str
 
 
@@ -86,23 +265,23 @@ def router_node(state: RAGState) -> RAGState:
                          unrelated to banking (math, geography, jokes, coding, etc.).
                          Examples: "hi", "how are you", "bye", "1+1", "capital of France".
 
-            "product"  — asks about SPECIFIC customer data answerable from the DB alone:
+            "banking_data"  — asks about SPECIFIC customer data answerable from the DB alone:
                         account balance, transaction history, credit card details,
                         fixed deposits, loan status, EMI amounts, outstanding dues.
                         Typically mentions an account number or "my account/balance"
                         AND does NOT also ask about policies, eligibility rules, or
-                        product features that require the knowledge base.
+                        banking_data features that require the knowledge base.
 
-            "document" — asks about general banking knowledge alone: product features,
+            "document" — asks about general banking knowledge alone: prod features,
                         interest rates, eligibility criteria, policies, fees, procedures,
                         terms & conditions — with NO reference to a specific customer's
                         live account data.
 
             "hybrid"   — the query genuinely needs BOTH live customer/account data
-                        from the database AND policy/product knowledge from the PDF
+                        from the database AND policy/banking_data knowledge from the PDF
                         knowledge base to give a complete answer. Use this when the
                         question cross-references a specific customer's data against
-                        a bank policy or product rule.
+                        a bank policy or banking_data rule.
                         Examples:
                           "Does James (account 1345367) qualify for a top-up home loan?"
                           "Based on my transaction history, am I eligible for a credit card upgrade?"
@@ -111,9 +290,9 @@ def router_node(state: RAGState) -> RAGState:
                           "Can I get a personal loan given my outstanding home loan balance?"
                           "Show my last 3 months spending and explain any applicable cashback policy."
 
-            Priority order: memory → smalltalk → hybrid → product → document.
+            Priority order: memory → smalltalk → hybrid → banking_data → document.
             Choose "hybrid" whenever the answer requires fetching live DB data AND
-            looking up a policy/product rule; do NOT split such queries into product
+            looking up a policy/banking_data rule; do NOT split such queries into banking_data
             or document alone.
 
             Context: {history_hint}
@@ -415,7 +594,7 @@ def generate_answer_node(state: RAGState) -> RAGState:
 #
 # This node handles queries that need BOTH:
 #   • Live customer / account data  → executed via NL2SQL against the DB
-#   • Policy / product knowledge    → retrieved from the PDF knowledge base
+#   • Policy / banking_data knowledge    → retrieved from the PDF knowledge base
 #
 # Pipeline:
 #   1. Run NL2SQL exactly like nl2sql_node (generate + execute SQL)
@@ -520,7 +699,7 @@ def hybrid_rag_node(state: RAGState) -> RAGState:
         f"Page: {doc.metadata.get('page', -1) + 1 if doc.metadata.get('page') is not None else '?'}]\n"
         f"{doc.page_content}"
         for doc in reranked_docs
-    ]) if reranked_docs else "(No relevant policy/product documents found.)"
+    ]) if reranked_docs else "(No relevant policy/banking_data documents found.)"
 
     db_context = (
         f"SQL Query Executed:\n{generated_sql}\n\nQuery Results:\n{sql_result}"
@@ -542,13 +721,13 @@ def hybrid_rag_node(state: RAGState) -> RAGState:
             balances, transaction history, loan details, FD holdings, credit card
             status, EMI schedules, etc.
 
-            SOURCE B — Bank Policy & Product Knowledge Base (from ingested PDFs):
+            SOURCE B — Bank Policy & banking_data Knowledge Base (from ingested PDFs):
             This contains general banking policies, eligibility rules, interest rate
-            tables, product features, fee schedules, terms & conditions, etc.
+            tables, banking_data features, fee schedules, terms & conditions, etc.
 
             Your task:
             1. Use SOURCE A facts to ground the answer in the customer's actual situation.
-            2. Use SOURCE B to apply the relevant policy, eligibility rule, or product
+            2. Use SOURCE B to apply the relevant policy, eligibility rule, or banking_data
                information to those facts.
             3. Synthesise BOTH into a single coherent, accurate, helpful answer.
             4. Be explicit about which part comes from the customer's data vs. the policy.
@@ -625,7 +804,7 @@ def build_rag_graph():
         {
             "memory":    "memory",
             "smalltalk": "smalltalk",
-            "product":   "nl2sql",
+            "banking_data":   "nl2sql",
             "document":  "vector_search",
             "hybrid":    "hybrid_rag",     # ← new route
         }
@@ -665,8 +844,26 @@ def run_search_agent(query: str, chat_history: List[Dict[str, Any]] = None) -> d
         "hybrid_rag_sql_result":  "",   # ← new field
         "chat_history":           chat_history or [],
     }
-    final_state = rag_graph.invoke(initial_state)
-    return final_state["response"]
+    trace_config, run_id, base_metadata = _build_trace_config(
+        query=query,
+        chat_history=chat_history,
+        session_type="api",
+        run_name="smart_banking_agent",
+        extra_tags=["api"],
+    )
+
+    final_state = rag_graph.invoke(initial_state, config=trace_config)
+
+    evaluator_metadata = _build_evaluator_metadata(final_state)
+    _safe_update_langsmith_metadata(run_id, {**base_metadata, **evaluator_metadata})
+
+    response = _capture_final_response_for_evaluators(
+        query=query,
+        response=final_state["response"],
+        evaluator_metadata=evaluator_metadata,
+    )
+
+    return response
 
 
 async def run_search_agent_stream(query: str, chat_history: List[Dict[str, Any]] = None):
@@ -685,8 +882,24 @@ async def run_search_agent_stream(query: str, chat_history: List[Dict[str, Any]]
         "chat_history":           chat_history or [],
     }
 
-    final_state = rag_graph.invoke(initial_state)
-    response = final_state.get("response", {})
+    trace_config, run_id, base_metadata = _build_trace_config(
+        query=query,
+        chat_history=chat_history,
+        session_type="streaming_api",
+        run_name="smart_banking_agent_stream",
+        extra_tags=["streaming"],
+    )
+
+    final_state = rag_graph.invoke(initial_state, config=trace_config)
+
+    evaluator_metadata = _build_evaluator_metadata(final_state)
+    _safe_update_langsmith_metadata(run_id, {**base_metadata, **evaluator_metadata})
+
+    response = _capture_final_response_for_evaluators(
+        query=query,
+        response=final_state.get("response", {}),
+        evaluator_metadata=evaluator_metadata,
+    )
 
     answer: str = _clean_answer(
         response.get("answer", "I'm sorry, I couldn't generate a response.")
@@ -705,6 +918,7 @@ async def run_search_agent_stream(query: str, chat_history: List[Dict[str, Any]]
         "page_no":            response.get("page_no", ""),
         "document_name":      response.get("document_name", ""),
         "sql_query_executed": response.get("sql_query_executed"),
+        "evaluator_metadata": evaluator_metadata,
     }
     yield f"data:{json.dumps(meta)}\n\n"
     yield "data:[DONE]\n\n"
