@@ -32,6 +32,12 @@ PII_ENTITIES = [
 TOXICITY_THRESHOLD = float(os.getenv("GUARDRAIL_TOXICITY_THRESHOLD", "0.5"))
 CUSTOMER_ID_RE = re.compile(r"\b\d{6,}\b")  # Mask numeric customer IDs
 
+# GuardrailsPII (and our own substitution) emit <ENTITY_TYPE> placeholders.
+# Streamlit's markdown renderer silently drops angle-bracket tags, leaving
+# bare text like "account: " instead of "account: [ACCOUNT_NUMBER]".
+# This regex rewrites all such tags to square-bracket form so they render.
+_HTML_PII_TAG_RE = re.compile(r"<([A-Z][A-Z0-9_]*)>")
+
 class GuardrailViolation(Exception):
     """Raised when input guardrail blocks a request."""
     def __init__(self, guard: str, message: str):
@@ -110,7 +116,11 @@ def guard_output(answer: str) -> str:
     """Redact PII from the model's answer."""
     if not answer:
         return answer
-    answer = CUSTOMER_ID_RE.sub("<CUSTOMER_ID>", answer)
+    answer = CUSTOMER_ID_RE.sub("[CUSTOMER_ID]", answer)
     guards = _get_guards()
     outcome = guards["pii"].validate(answer)
-    return getattr(outcome, "validated_output", None) or answer
+    redacted = getattr(outcome, "validated_output", None) or answer
+    # Rewrite any remaining <TAG> placeholders from GuardrailsPII to [TAG]
+    # so Streamlit's markdown renderer displays them instead of dropping them.
+    redacted = _HTML_PII_TAG_RE.sub(r"[\1]", redacted)
+    return redacted
